@@ -87,6 +87,16 @@ performance."
   :group 'copilot
   :type 'integer)
 
+(defcustom copilot-server-log-level 0
+  "Log level of the Copilot server.
+0 - no log
+1 - error
+2 - warning
+3 - info
+4 - debug"
+  :group 'copilot
+  :type 'integer)
+
 (defcustom copilot-node-executable (executable-find "node")
   "Node executable path."
   :group 'copilot
@@ -175,6 +185,32 @@ Incremented after each change.")
 
 (defvar copilot--opened-buffers nil
   "List of buffers that have been opened in Copilot.")
+
+(eval-and-compile
+  (defun copilot--transform-pattern (pattern)
+    "Transform PATTERN to (&plist PATTERN) recursively."
+    (cons '&plist
+          (mapcar (lambda (p)
+                    (if (listp p)
+                        (copilot--transform-pattern p)
+                      p))
+                  pattern))))
+
+(defmacro copilot--dbind (pattern source &rest body)
+  "Destructure SOURCE against plist PATTERN and eval BODY."
+  (declare (indent 2))
+  `(-let ((,(copilot--transform-pattern pattern) ,source))
+     ,@body))
+
+(defsubst copilot--log (level format &rest args)
+  "Log message with LEVEL, FORMAT and ARGS."
+  (message "%s: %s" (propertize "Copilot" 'face
+                                (pcase level
+                                  ('error 'error)
+                                  ('warning 'warning)
+                                  ('info 'success)
+                                  (_ 'warning)))
+           (apply #'format format args)))
 
 ;;
 ;; Externals
@@ -284,6 +320,91 @@ SUCCESS-FN is the CALLBACK."
                                                   (funcall ,success-fn result))))
                               ,@args))))
 
+(defvar copilot--panel-lang nil
+  "Language of current panel solutions.")
+
+(defvar copilot--request-handlers (make-hash-table :test 'equal)
+  "Hash table storing request handlers.")
+
+(defun copilot-on-request (method handler)
+  "Register HANDLER to be called when a request of type METHOD is received.
+Each METHOD can have only one HANDLER."
+  (puthash method handler copilot--request-handlers))
+
+(defun copilot--handle-request (_ method msg)
+  "Handle MSG of type METHOD by calling the appropriate registered handler."
+  (let ((handler (gethash method copilot--request-handlers)))
+    (when handler
+      (funcall handler msg))))
+
+(defvar copilot--notification-handlers (make-hash-table :test 'equal)
+  "Hash table storing lists of notification handlers.")
+
+(defun copilot-on-notification (method handler)
+  "Register HANDLER to be called when a notification of type METHOD is received."
+  (let ((handlers (gethash method copilot--notification-handlers '())))
+    (unless (member handler handlers)
+      (puthash method (cons handler handlers) copilot--notification-handlers))))
+
+(defun copilot--handle-notification (_ method msg)
+  "Handle MSG of type METHOD by calling all appropriate registered handlers."
+  (let ((handlers (gethash method copilot--notification-handlers '())))
+    (dolist (handler handlers)
+      (funcall handler msg))))
+
+(defun copilot--init-notification-handlers ()
+  "Initialize notification handlers."
+  (copilot-on-notification
+   'window/logMessage
+   (lambda (msg)
+     (copilot--dbind (:type log-level :message log-msg) msg
+       (when (>= copilot-server-log-level log-level)
+         (with-current-buffer (get-buffer-create "*copilot agent log*")
+           (save-excursion
+             (goto-char (point-max))
+             (insert (propertize (concat log-msg "\n")
+                                 'face (pcase log-level
+                                         (4 'shadow)
+                                         (3 'success)
+                                         (2 'warning)
+                                         (1 'error))))))))))
+
+  (copilot-on-notification
+   'PanelSolution
+   (lambda (msg)
+     (copilot--dbind (:completionText completion-text :score completion-score) msg
+       (with-current-buffer "*copilot-panel*"
+         (unless (member (secure-hash 'sha256 completion-text)
+                         (org-map-entries (lambda () (org-entry-get nil "SHA"))))
+           (save-excursion
+             (goto-char (point-max))
+             (insert "* Solution\n"
+                     "  :PROPERTIES:\n"
+                     "  :SCORE: " (number-to-string completion-score) "\n"
+                     "  :SHA: " (secure-hash 'sha256 completion-text) "\n"
+                     "  :END:\n"
+                     "#+BEGIN_SRC " copilot--panel-lang "\n"
+                     completion-text "\n#+END_SRC\n\n")
+             (call-interactively #'mark-whole-buffer)
+             (org-sort-entries nil ?R nil nil "SCORE")))))))
+
+  (copilot-on-notification
+   'PanelSolutionsDone
+   (lambda (_msg)
+     (copilot--log 'info "Finish synthesizing solutions.")
+     (display-buffer "*copilot-panel*")
+     (with-current-buffer "*copilot-panel*"
+       (save-excursion
+         (goto-char (point-max))
+         (insert "End of solutions.\n"))))))
+
+(defun copilot--command ()
+  "Return the command-line to start copilot agent."
+  (append
+   (list copilot-node-executable
+         (copilot-server-executable))
+   copilot-server-args))
+
 (defun copilot--make-connection ()
   "Establish copilot jsonrpc connection."
   (let ((make-fn (apply-partially
@@ -293,10 +414,7 @@ SUCCESS-FN is the CALLBACK."
                   :request-dispatcher #'copilot--handle-request
                   :notification-dispatcher #'copilot--handle-notification
                   :process (make-process :name "copilot agent"
-                                         :command (append
-                                                   (list copilot-node-executable
-                                                         (copilot-server-executable))
-                                                   copilot-server-args)
+                                         :command (copilot--command)
                                          :coding 'utf-8-emacs-unix
                                          :connection-type 'pipe
                                          :stderr (get-buffer-create "*copilot stderr*")
@@ -327,34 +445,20 @@ Please upgrade the server via `M-x copilot-reinstall-server`"))
              (user-error "Node 18+ is required but found %s" node-version))
             (t
              (setq copilot--connection (copilot--make-connection))
-             (message "Copilot agent started.")
-             (copilot--request 'initialize '(:capabilities (:workspace (:workspaceFolders t))))
+             (copilot--log 'info "Copilot agent started.")
+             (copilot--request 'initialize `( :capabilities (:workspace (:workspaceFolders t))
+                                              :processId ,(emacs-pid)))
              (copilot--notify 'initialized '())
              (copilot--async-request 'setEditorInfo
-                                     `(:editorInfo (:name "Emacs" :version ,emacs-version)
-                                                   :editorPluginInfo (:name "copilot.el" :version ,copilot-version)
-                                                   ,@(when copilot-network-proxy
-                                                       `(:networkProxy ,copilot-network-proxy))))))))))
+                                     `( :editorInfo (:name "Emacs" :version ,emacs-version)
+                                        :editorPluginInfo (:name "copilot.el" :version ,copilot-version)
+                                        ,@(when copilot-network-proxy
+                                            `(:networkProxy ,copilot-network-proxy))))
+             (copilot--init-notification-handlers)))))))
 
 ;;
 ;; login / logout
 ;;
-
-(eval-and-compile
-  (defun copilot--transform-pattern (pattern)
-    "Transform PATTERN to (&plist PATTERN) recursively."
-    (cons '&plist
-          (mapcar (lambda (p)
-                    (if (listp p)
-                        (copilot--transform-pattern p)
-                      p))
-                  pattern))))
-
-(defmacro copilot--dbind (pattern source &rest body)
-  "Destructure SOURCE against plist PATTERN and eval BODY."
-  (declare (indent 2))
-  `(-let ((,(copilot--transform-pattern pattern) ,source))
-     ,@body))
 
 (defun copilot-login ()
   "Login to Copilot."
@@ -374,19 +478,19 @@ automatically, browse to %s." user-code verification-uri))
           (read-from-minibuffer "Press ENTER if you finish authorizing."))
       (read-from-minibuffer (format "First copy your one-time code: %s. Press ENTER to continue." user-code))
       (read-from-minibuffer (format "Please open %s in your browser. Press ENTER if you finish authorizing." verification-uri)))
-    (message "Verifying...")
+    (copilot--log 'info "Verifying...")
     (condition-case err
         (copilot--request 'signInConfirm (list :userCode user-code))
       (jsonrpc-error
        (user-error "Authentication failure: %s" (alist-get 'jsonrpc-error-message (cddr err)))))
     (copilot--dbind (:user) (copilot--request 'checkStatus '(:dummy "checkStatus"))
-      (message "Authenticated as GitHub user %s." user))))
+      (copilot--log 'info "Authenticated as GitHub user %s." user))))
 
 (defun copilot-logout ()
   "Logout from Copilot."
   (interactive)
   (copilot--request 'signOut '(:dummy "signOut"))
-  (message "Logged out."))
+  (copilot--log 'warning "Logged out."))
 
 ;;
 ;; diagnose
@@ -396,7 +500,7 @@ automatically, browse to %s." user-code verification-uri))
   "Restart and diagnose copilot."
   (interactive)
   (when copilot--connection
-    (jsonrpc-shutdown copilot--connection)
+    (jsonrpc-shutdown copilot--connection 'kill)
     (setq copilot--connection nil))
   (setq copilot--opened-buffers nil)
   ;; We are going to send a test request for the current buffer so we have to activate the mode
@@ -415,11 +519,11 @@ automatically, browse to %s." user-code verification-uri))
                                            :languageId "text"
                                            :position (:line 0 :character 0)))
                           :success-fn (lambda (_)
-                                        (message "Copilot OK."))
+                                        (copilot--log 'info "Copilot OK."))
                           :error-fn (lambda (err)
-                                      (message "Copilot error: %S" err))
+                                      (copilot--log 'error "%S" err))
                           :timeout-fn (lambda ()
-                                        (message "Copilot agent timeout."))))
+                                        (copilot--log 'warning "Copilot agent timeout."))))
 
 ;;
 ;; Auto completion
@@ -597,9 +701,9 @@ automatically, browse to %s." user-code verification-uri))
                                              :key (lambda (x) (plist-get x :text))
                                              :test #'s-equals-p)))
       (cond ((seq-empty-p completions)
-             (message "No completion is available."))
+             (copilot--log 'warning "No completion is available."))
             ((= (length completions) 1)
-             (message "Only one completion is available."))
+             (copilot--log 'warning "Only one completion is available."))
             (t (let ((idx (mod (+ copilot--completion-idx direction)
                                (length completions))))
                  (setq copilot--completion-idx idx)
@@ -623,80 +727,6 @@ automatically, browse to %s." user-code verification-uri))
   (when (copilot--overlay-visible)
     (copilot--get-completions-cycling (copilot--cycle-completion -1))))
 
-(defvar copilot--panel-lang nil
-  "Language of current panel solutions.")
-
-(defvar copilot--request-handlers (make-hash-table :test 'equal)
-  "Hash table storing request handlers.")
-
-(defun copilot-on-request (method handler)
-  "Register HANDLER to be called when a request of type METHOD is received.
-Each METHOD can have only one HANDLER."
-  (puthash method handler copilot--request-handlers))
-
-(defun copilot--handle-request (_ method msg)
-  "Handle MSG of type METHOD by calling the appropriate registered handler."
-  (let ((handler (gethash method copilot--request-handlers)))
-    (when handler
-      (funcall handler msg))))
-
-(defvar copilot--notification-handlers (make-hash-table :test 'equal)
-  "Hash table storing lists of notification handlers.")
-
-(defun copilot-on-notification (method handler)
-  "Register HANDLER to be called when a notification of type METHOD is received."
-  (let ((handlers (gethash method copilot--notification-handlers '())))
-    (puthash method (cons handler handlers) copilot--notification-handlers)))
-
-(defun copilot--handle-notification (_ method msg)
-  "Handle MSG of type METHOD by calling all appropriate registered handlers."
-  (let ((handlers (gethash method copilot--notification-handlers '())))
-    (dolist (handler handlers)
-      (funcall handler msg))))
-
-(copilot-on-notification
- 'window/logMessage
- (lambda (msg)
-   (copilot--dbind (:type log-level :message log-msg) msg
-     (with-current-buffer (get-buffer-create "*copilot agent log*")
-       (save-excursion
-         (goto-char (point-max))
-         (insert (propertize (concat log-msg "\n")
-                             'face (pcase log-level
-                                     (4 '(:foreground "gray"))
-                                     (3 '(:foreground "green"))
-                                     (2 '(:foreground "yellow"))
-                                     (1 '(:foreground "red"))))))))))
-
-(copilot-on-notification
- 'PanelSolution
- (lambda (msg)
-   (copilot--dbind (:completionText completion-text :score completion-score) msg
-     (with-current-buffer "*copilot-panel*"
-       (unless (member (secure-hash 'sha256 completion-text)
-                       (org-map-entries (lambda () (org-entry-get nil "SHA"))))
-         (save-excursion
-           (goto-char (point-max))
-           (insert "* Solution\n"
-                   "  :PROPERTIES:\n"
-                   "  :SCORE: " (number-to-string completion-score) "\n"
-                   "  :SHA: " (secure-hash 'sha256 completion-text) "\n"
-                   "  :END:\n"
-                   "#+BEGIN_SRC " copilot--panel-lang "\n"
-                   completion-text "\n#+END_SRC\n\n")
-           (call-interactively #'mark-whole-buffer)
-           (org-sort-entries nil ?R nil nil "SCORE")))))))
-
-(copilot-on-notification
- 'PanelSolutionsDone
- (lambda (_msg)
-   (message "Copilot: Finish synthesizing solutions.")
-   (display-buffer "*copilot-panel*")
-   (with-current-buffer "*copilot-panel*"
-     (save-excursion
-       (goto-char (point-max))
-       (insert "End of solutions.\n")))))
-
 (defun copilot--get-panel-completions (callback)
   "Get panel completions with CALLBACK."
   (copilot--async-request 'getPanelCompletions
@@ -704,9 +734,9 @@ Each METHOD can have only one HANDLER."
                                 :panelId (generate-new-buffer-name "copilot-panel"))
                           :success-fn callback
                           :error-fn (lambda (err)
-                                      (message "Copilot error: %S" err))
+                                      (copilot--log 'error "%S" err))
                           :timeout-fn (lambda ()
-                                        (message "Copilot agent timeout."))))
+                                        (copilot--log 'warning "Copilot agent timeout."))))
 
 
 (defun copilot-panel-complete ()
@@ -718,7 +748,7 @@ Each METHOD can have only one HANDLER."
 
   (copilot--get-panel-completions
    (jsonrpc-lambda (&key solutionCountTarget)
-     (message "Copilot: Synthesizing %d solutions..." solutionCountTarget)))
+     (copilot--log 'info "Synthesizing %d solutions..." solutionCountTarget)))
   (with-current-buffer (get-buffer-create "*copilot-panel*")
     (org-mode)
     (erase-buffer)))
@@ -969,7 +999,7 @@ Arguments BEG, END, and CHARS-REPLACED are metadata for region changed."
          (if completion
              (copilot--show-completion completion)
            (when called-interactively
-             (message "No completion is available."))))))))
+             (copilot--log 'warning "No completion is available."))))))))
 
 ;;
 ;; minor mode
@@ -1137,7 +1167,7 @@ in `post-command-hook'."
          npm-binary
          "-g" "--prefix" copilot-install-dir
          "install" (format "%s@%s" copilot-server-package-name copilot-version)))
-    (message "Unable to install %s via `npm' because it is not present" copilot-server-package-name)
+    (copilot--log 'warning "Unable to install %s via `npm' because it is not present" copilot-server-package-name)
     nil))
 
 ;;;###autoload
@@ -1154,7 +1184,7 @@ in `post-command-hook'."
   (unless (file-directory-p copilot-install-dir)
     (user-error "Couldn't find %s directory" copilot-install-dir))
   (delete-directory copilot-install-dir 'recursive)
-  (message "Server `%s' uninstalled." (file-name-nondirectory (directory-file-name copilot-install-dir))))
+  (copilot--log 'warning "Server `%s' uninstalled." (file-name-nondirectory (directory-file-name copilot-install-dir))))
 
 (provide 'copilot)
 ;;; copilot.el ends here
